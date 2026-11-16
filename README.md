@@ -1,10 +1,56 @@
-# Scriptable GitHub Loader
+# Atlas Bus Tracker + Scriptable GitHub Loader
 
 Run an iPhone or iPad Scriptable widget from a JavaScript file hosted on GitHub. Each time iOS runs the loader, it fetches the current file. If fetching fails, it uses the last downloaded, syntactically valid copy cached on that device.
 
 **Public repositories need no GitHub token.** Private repository tokens are optional and stored in Scriptable Keychain, never in the published JavaScript.
 
-This repository contains the loader and a working demo widget. The Atlas Shuttle Tracker (`script.js`) and classes widget (`brightspace.js`) mentioned in the original loader are **not included**. You can add your own scripts using the instructions below.
+This repository includes the **Atlas Shuttle Tracker** ([script.js](script.js)), an on-device connection setup script ([setup-bus.js](setup-bus.js)), the GitHub loader, and a demo widget. The classes widget (`brightspace.js`) is not included.
+
+The tracker needs an authorized bus location feed. No Supabase endpoint, bus identifier, or API key is embedded in this repository. Forking this project does not create a tracking backend or provide access to a shuttle operator’s data.
+
+## Set up the Atlas bus tracker
+
+1. Install [Scriptable](https://scriptable.app/) on your iPhone or iPad.
+2. Obtain an **authorized Supabase bus location REST URL** and its **publishable key** (or legacy **anon key**) from your feed administrator. If you operate the backend, find these in your Supabase project’s API settings. Do not use a secret key or `service_role` key. An API key alone does not grant access: the backend must allow the intended reads through its Row Level Security policies.
+3. The endpoint should select the latest location for **one bus**, for example:
+
+   ```text
+   https://YOUR_PROJECT.supabase.co/rest/v1/bus_locations?select=latitude,longitude,speed_mph,recorded_at&bus_id=eq.YOUR_BUS_ID&order=recorded_at.desc&limit=1
+   ```
+
+   Replace `YOUR_PROJECT` and `YOUR_BUS_ID` with the values supplied by your administrator. The location producer must already be writing records; this project is a client widget, not a GPS collector or backend deployment.
+4. Open [setup-bus.js](setup-bus.js), choose **Raw**, and copy it into a new Scriptable script named **Setup Bus**. Run it inside the app. Enter your complete endpoint URL and key, then tap **Save**. The settings are stored in Scriptable Keychain on that device. They are separate from the optional GitHub token.
+5. Choose how to run the tracker:
+   - **Direct:** Copy [script.js](script.js) into Scriptable as **Atlas Bus** and run it. A medium preview should appear. Add a medium Scriptable Home Screen widget and select **Atlas Bus** as its script. No widget parameter is needed.
+   - **Automatic source updates:** Follow the Loader setup below, then set the Home Screen widget’s script to **Loader** and its **Parameter** to `script.js`. Use a **medium** widget for the route and timetable. To preview the tracker in the app through Loader, change `DEFAULT_FILE` in your phone’s Loader script to `"script.js"`, then choose **Run widget**.
+6. If you see **Setup needed**, run Setup Bus on the same device. For **No Signal**, check connectivity, the endpoint filter, key permissions, and whether the feed contains a valid record. No Supabase requests are made outside service hours.
+
+To change the connection, run Setup Bus again. To remove it, clear both fields and save. Do not put connection details in GitHub files or widget parameters. This repository does not publish the connection settings supplied by the original author.
+
+### Location feed format
+
+The endpoint must return a JSON array with the newest record first (or a single object):
+
+```json
+[{
+  "latitude": 33.943026,
+  "longitude": -83.338263,
+  "speed_mph": 12,
+  "recorded_at": "2026-11-16T15:00:00Z"
+}]
+```
+
+The timestamp above only illustrates the format. The live feed must supply current timestamps with a timezone. The parser also accepts `lat`, `lng`/`lon`, or `location.latitude`/`location.longitude`. Speed is in miles per hour; missing or invalid speed is treated as zero. Invalid or missing coordinates show **No Signal**. Missing/invalid timestamps show **UNVERIFIED**; records older than 10 minutes (or over a minute in the future) show **STALE** and suppress the ETA. There is no offline cache of bus telemetry. The Loader’s cache holds JavaScript source only.
+
+### Route, hours, and ETA limits
+
+The supplied route is ATL → MAIN → JOUR → TATE → BOYD → COL → ADER → JOE → ATL. The widget retains the original coordinates, stop radii, and weekday Atlas departure timetable. Verify the timetable and route with the operator; holidays and service exceptions are not modeled.
+
+Service hours are Monday–Friday, 6:45 AM–7 PM in `America/New_York`, including daylight saving time. `FORCE_ONLINE` defaults to `false`; set it to `true` only for testing outside those hours. The widget requests another refresh in 30 seconds, but iOS chooses the actual refresh time.
+
+ETAs are rough estimates using straight-line distance to the stop after the nearest stop and reported speed, falling back to 5 mph when stationary. The route display assumes forward travel in the listed stop order; it does not infer direction from GPS history or model road travel, traffic, or dwell times. A nearest stop is not always the last stop passed. Treat the result as an approximation, not an official arrival prediction.
+
+To adapt this to another route, edit `ROUTE_STOPS`, `SCHEDULED_TIMES`, `SERVICE_TIME_ZONE`, and the service-hours logic in your own copy of `script.js`, then configure that route’s feed on your device.
 
 ## Quick setup: try the demo
 
@@ -35,7 +81,7 @@ The defaults point to this repository's public demo. No account or token is requ
 5. Run Loader in the app once while online to confirm the configuration and populate the cache.
 6. Commit updates to the selected branch. The loader fetches those updates the next time iOS runs it.
 
-Use one Loader script for several widgets by giving each widget a different Parameter, such as `script.js` and `brightspace.js`, after uploading those files yourself.
+Use one Loader script for several widgets by giving each widget a different Parameter. Use `script.js` for the included Atlas tracker and `example-widget.js` for the demo. Other targets, such as `brightspace.js`, must be added by you.
 
 The parameter must be a repository-relative path ending in `.js`, not a GitHub URL. Paths with empty segments, `.`, or `..` are rejected. Nested paths, spaces, and branch names containing slashes are URL-encoded.
 
@@ -96,7 +142,7 @@ Private repository source is cached as plain text on-device. Keep personal data 
 Node.js 18+ is only needed to run the local mocked tests, not to use the widget:
 
 ```sh
-node --test tests/loader.test.cjs
+node --test tests/*.test.cjs
 ```
 
 Tests mock the Scriptable APIs; final device behavior should be checked in Scriptable on iOS.
