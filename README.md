@@ -63,6 +63,12 @@ The Atlas timetable uses Monday–Friday, 6:45 AM–7 PM in `America/New_York` a
 
 To end the detour, change `ACTIVE_ROUTE` in [script.js](script.js) from `"magnolia-detour"` to `"regular"`. This restores the Main Library stop and clears the previous route’s progress on the next update. To estimate times on the restored route, set that profile’s `etaHistoryFrom` to the timezone-qualified resumption time. To edit the detour in the future, update its `stops` and `exitsAfter` together and move `etaHistoryFrom` forward to the new route’s effective time.
 
+### Thursday night shuttle
+
+At 9 PM Thursday Eastern, the widget switches to a purple disco theme with 🪩 and 🍾 and displays a 10 PM start notice. At 10 PM, tracking switches to **Atlas Athens → The Arch → Atlas Athens**. The night theme and route extend past midnight and end at 3 AM Friday Eastern by default. Adjust `THURSDAY_NIGHT.fridayEnds` in [script.js](script.js) when the end time is confirmed.
+
+The Arch geofence is centered on the [mapped UGA landmark](https://www.openstreetmap.org/node/4886558902). Check that the shuttle’s actual pickup curb falls within the geofence. The night route confirms stops and estimates travel time using GPS observations from its own service window. iOS applies the theme and route when it next refreshes the widget.
+
 ## Quick setup: try the demo
 
 1. Install [Scriptable](https://scriptable.app/) on your iPhone or iPad.
@@ -156,5 +162,5 @@ Node.js 18+ is only needed to run the local mocked tests, not to use the widget:
 node --test tests/*.test.cjs
 ```
 
-Tests mock the Scriptable APIs and replay GPS fixtures for both highway legs, missed updates, stop confirmation, return to Atlas, and the ETA fallback. On iPhone, run Loader with `script.js` in the app and check the medium widget during one full loop. Confirm that Exit 7 points toward Journalism, Exit 8 points toward Atlas Athens, the stop labels advance at the actual pickups, and the feed still updates outside the timetable when the bus sends data.
+Tests mock the Scriptable APIs and replay GPS fixtures for both highway legs, missed updates, stop confirmation, return to Atlas, and the ETA fallback. They also cover Thursday night transitions, daylight saving time, and both directions of the Arch loop. On iPhone, run Loader with `script.js` in the app and check the medium widget. For the detour, confirm that Exit 7 points toward Journalism and Exit 8 points toward Atlas Athens. On Thursday night, confirm that the theme appears at the next refresh after 9 PM and that tracking switches to the Arch loop after 10 PM.
 

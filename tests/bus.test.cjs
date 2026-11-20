@@ -15,6 +15,7 @@ const STOPS = {
   COL: [33.942599, -83.376988],
   ADER: [33.941406, -83.373222],
   JOE: [33.939599, -83.370638],
+  ARCH: [33.9575243, -83.3752855],
 };
 
 function fix(place, seconds, speed = 0, heading = 90, now = NOW) {
@@ -65,7 +66,7 @@ function harness(options = {}) {
       setPadding() {}
       async presentMedium() { events.previews++; }
     },
-    LinearGradient: class {}, Color: class {},
+    LinearGradient: class {}, Color: class { constructor(hex) { this.hex = hex; } },
     Font: { boldSystemFont() {}, systemFont() {} },
     console: { warn() {} },
     Script: { complete: () => events.complete++, setWidget: widget => events.widgets.push(widget) },
@@ -125,6 +126,78 @@ test("nighttime and weekends fetch and display live telemetry alongside the time
     assert.ok(h.events.texts.includes("At: Atlas Athens"));
     assert.ok(h.events.texts.includes("Atlas schedule · " + schedule));
   }
+});
+
+test("disco theme and Arch route turn on at separate Thursday times in Eastern time", async () => {
+  const dayRoute = "ATL → JOUR → TATE → BOYD → COL → ADER → JOE → ATL";
+  const nightRoute = "ATL → ARCH → ATL";
+  for (const [time, disco, night] of [
+    ["2026-11-20T01:59:59Z", false, false], // Thursday 8:59 PM EST
+    ["2026-11-20T02:00:00Z", true, false],
+    ["2026-11-20T02:59:59Z", true, false],
+    ["2026-11-20T03:00:00Z", true, true],
+    ["2026-11-20T05:00:00Z", true, true],
+    ["2026-11-20T07:59:59Z", true, true],
+    ["2026-11-20T08:00:00Z", false, false],
+    ["2026-11-21T03:00:00Z", false, false], // Friday 10 PM EST
+    ["2026-07-10T01:00:00Z", true, false], // Thursday 9 PM EDT
+    ["2026-07-10T02:00:00Z", true, true],
+    ["2026-07-10T07:00:00Z", false, false],
+  ]) {
+    const h = harness({ secrets: connection(), now: Date.parse(time) });
+    await h.run(source);
+    assert.equal(h.events.texts.includes("ATLAS  🪩 🍾"), disco, time);
+    assert.equal(h.events.texts.includes("The Arch shuttle starts at 10 PM"), disco && !night, time);
+    assert.equal(h.events.texts.includes("Thursday night shuttle · 10 PM start"), night, time);
+    assert.ok(h.events.texts.includes(night ? nightRoute : dayRoute), time);
+    assert.equal(h.events.requests.length, 1, time);
+    assert.equal(h.events.widgets[0].backgroundGradient.colors[0].hex, disco ? "#4C155E" : "#1c1c1e", time);
+  }
+});
+
+test("Thursday night tracking alternates between Atlas and the Arch", async () => {
+  const now = Date.parse("2026-11-20T05:15:00Z");
+  const secrets = connection();
+  const rows = [
+    fix("ATL", -120, 0, 90, now), fix("ATL", -60, 0, 90, now), fix("JOUR", 0, 28, 90, now),
+  ];
+  const outbound = await widgetFor(rows, { secrets, now });
+  assert.ok(outbound.events.texts.includes("Next: The Arch"));
+  assert.ok(outbound.events.texts.includes("ETA unavailable"));
+  assert.ok(!outbound.events.texts.some(text => text.includes("Exit")));
+  const atArch = await widgetFor([fix("ARCH", 60, 0, 90, now), fix("ARCH", 120, 0, 90, now)], {
+    secrets, now: now + 120000,
+  });
+  assert.ok(atArch.events.texts.includes("At: The Arch"));
+  assert.ok(atArch.events.texts.includes("Next: Atlas Athens"));
+  const returned = await widgetFor([fix("ATL", 240, 0, 90, now), fix("ATL", 300, 0, 90, now)], {
+    secrets, now: now + 300000,
+  });
+  assert.ok(returned.events.texts.includes("At: Atlas Athens"));
+  assert.ok(returned.events.texts.includes("Next: The Arch"));
+});
+
+test("Thursday route switches exclude earlier observations and saved progress from the other route", async () => {
+  const start = Date.parse("2026-11-20T03:00:00Z");
+  const secrets = connection();
+  const dayRows = [fix("JOE", -120, 0, 90, start), fix("JOE", -60, 0, 90, start)];
+  const before = await widgetFor(dayRows, { secrets, now: start - 60000 });
+  assert.ok(before.events.texts.includes("Highway via Exit 8 · ETA unavailable"));
+  const atStart = await widgetFor(dayRows, { secrets, now: start });
+  assert.ok(atStart.events.texts.includes("Route position unknown"));
+  assert.ok(atStart.events.texts.includes("ATL → ARCH → ATL"));
+  const mixed = await widgetFor([
+    fix("ATL", -60, 0, 90, start), fix("ATL", 0, 0, 90, start),
+  ], { secrets, now: start });
+  assert.ok(mixed.events.texts.includes("Route position unknown"));
+
+  const end = Date.parse("2026-11-20T08:00:00Z");
+  const nightRows = [fix("ATL", -120, 0, 90, end), fix("ATL", -60, 0, 90, end)];
+  const lastNight = await widgetFor(nightRows, { secrets, now: end - 60000 });
+  assert.ok(lastNight.events.texts.includes("Next: The Arch"));
+  const atEnd = await widgetFor([...nightRows, fix("ATL", 0, 0, 90, end)], { secrets, now: end });
+  assert.ok(atEnd.events.texts.includes("Route position unknown"));
+  assert.ok(atEnd.events.texts.includes("ATL → JOUR → TATE → BOYD → COL → ADER → JOE → ATL"));
 });
 
 test("no connection gives setup guidance without making a request", async () => {
@@ -317,13 +390,27 @@ test("history request expands the single-bus query without changing saved settin
   assert.equal(secrets.get("atlas-shuttle-connection"), stored);
 });
 
-function historicalLeg(origin, destination, near, passTime, remaining, heading = 90) {
+function historicalLeg(origin, destination, near, passTime, remaining, heading = 90, now = NOW) {
   return [
-    fix(origin, passTime - 120), fix(origin, passTime - 60),
-    fix(near, passTime, 42, heading),
-    fix(destination, passTime + remaining), fix(destination, passTime + remaining + 45),
+    fix(origin, passTime - 120, 0, 90, now), fix(origin, passTime - 60, 0, 90, now),
+    fix(near, passTime, 42, heading, now),
+    fix(destination, passTime + remaining, 0, 90, now), fix(destination, passTime + remaining + 45, 0, 90, now),
   ];
 }
+
+test("night ETAs use comparable Thursday night trips and exclude daytime observations", async () => {
+  const now = Date.parse("2026-11-27T05:45:00Z");
+  const near = [33.937, -83.355];
+  const dayTrip = historicalLeg("ATL", "ARCH", near, -18000, 170, 90, now);
+  const nightTrip = historicalLeg("ATL", "ARCH", near, -1350, 190, 90, now);
+  const live = [fix("ATL", -120, 0, 90, now), fix("ATL", -60, 0, 90, now), fix(near, 0, 42, 90, now)];
+  const fallback = await widgetFor([...dayTrip, ...nightTrip, ...live], { now });
+  assert.ok(fallback.events.texts.includes("Next: The Arch"));
+  assert.ok(fallback.events.texts.includes("ETA unavailable"));
+  const secondNightTrip = historicalLeg("ATL", "ARCH", near, -2700, 185, 90, now);
+  const estimate = await widgetFor([...secondNightTrip, ...nightTrip, ...live], { now });
+  assert.ok(estimate.events.texts.includes("Approx. 3 min"));
+});
 
 test("ETAs for both highway legs come from matching completed GPS trips", async () => {
   const near = [33.937, -83.355]; // Synthetic test observation.

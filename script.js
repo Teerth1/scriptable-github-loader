@@ -15,6 +15,15 @@ const MAX_STOP_SPEED_MPH = 5;
 const HISTORY_ROWS = 1000;
 const ETA_WINDOW_MS = 7 * 86400000;
 const ETA_MATCH_MILES = 0.15;
+const THURSDAY_NIGHT = {
+  themeStarts: 21 * 60,
+  routeStarts: 22 * 60,
+  fridayEnds: 3 * 60, // Provisional end of the Thursday night window.
+};
+const SERVICE_CLOCK_FORMAT = new Intl.DateTimeFormat("en-US", {
+  timeZone: SERVICE_TIME_ZONE, weekday: "short",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
 
 // Monday–Friday departures from Atlas. Verify the current timetable with the operator.
 const SCHEDULED_TIMES = [
@@ -33,6 +42,8 @@ const STOPS = {
   COL: { name: "Coliseum", latitude: 33.942599, longitude: -83.376988, radius: 0.05 },
   ADER: { name: "Aderhold", latitude: 33.941406, longitude: -83.373222, radius: 0.05 },
   JOE: { name: "Joe Frank", latitude: 33.939599, longitude: -83.370638, radius: 0.05 },
+  // The mapped Arch landmark anchors the pickup area (OpenStreetMap node 4886558902).
+  ARCH: { name: "The Arch", latitude: 33.9575243, longitude: -83.3752855, radius: 0.05 },
 };
 
 const ACTIVE_ROUTE = "magnolia-detour";
@@ -48,8 +59,12 @@ const ROUTES = {
     exitsAfter: {},
     etaHistoryFrom: null,
   },
+  "thursday-night": {
+    stops: ["ATL", "ARCH"],
+    exitsAfter: {},
+    etaHistoryFrom: "2026-11-20T03:00:00Z",
+  },
 };
-const ROUTE = ROUTES[ACTIVE_ROUTE];
 
 function readConnection() {
   if (!Keychain.contains(SETTINGS_KEY)) return null;
@@ -124,12 +139,22 @@ function readNonnegativeNumber(value) {
 }
 
 function serviceClock(now = new Date()) {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: SERVICE_TIME_ZONE, weekday: "short",
-    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
-  }).formatToParts(now);
+  const parts = SERVICE_CLOCK_FORMAT.formatToParts(now);
   const value = type => parts.find(part => part.type === type).value;
   return { weekday: value("weekday"), minutes: Number(value("hour")) * 60 + Number(value("minute")) };
+}
+
+function isNightRoute({ weekday, minutes }) {
+  return (weekday === "Thu" && minutes >= THURSDAY_NIGHT.routeStarts) ||
+    (weekday === "Fri" && minutes < THURSDAY_NIGHT.fridayEnds);
+}
+
+function serviceFor(now) {
+  const clock = serviceClock(now);
+  const night = isNightRoute(clock);
+  const disco = night || (clock.weekday === "Thu" && clock.minutes >= THURSDAY_NIGHT.themeStarts);
+  const profile = night ? "thursday-night" : ACTIVE_ROUTE;
+  return { night, disco, profile, route: ROUTES[profile] };
 }
 
 function distanceInMiles(first, second) {
@@ -156,13 +181,13 @@ function getNextScheduledTimes(now = new Date()) {
   return upcoming.length ? upcoming : ["Done for today"];
 }
 
-function nextStop(stop) {
-  return ROUTE.stops[(ROUTE.stops.indexOf(stop) + 1) % ROUTE.stops.length];
+function nextStop(route, stop) {
+  return route.stops[(route.stops.indexOf(stop) + 1) % route.stops.length];
 }
 
-function stopCandidate(point) {
+function stopCandidate(route, point) {
   if (!point || point.speed > MAX_STOP_SPEED_MPH) return null;
-  const matches = ROUTE.stops.filter(stop => distanceInMiles(point, STOPS[stop]) <= STOPS[stop].radius);
+  const matches = route.stops.filter(stop => distanceInMiles(point, STOPS[stop]) <= STOPS[stop].radius);
   return matches.length === 1 ? matches[0] : null;
 }
 
@@ -176,18 +201,18 @@ function isNearbyOutside(point, stop) {
   return distance > stop.radius && distance <= 0.45 && !(point.speed > 30);
 }
 
-function isUnexpectedHighwayStop(visit, stop) {
-  return Boolean(ROUTE.exitsAfter[visit?.stop] && nextStop(visit.stop) !== stop);
+function isUnexpectedHighwayStop(route, visit, stop) {
+  return Boolean(route.exitsAfter[visit?.stop] && nextStop(route, visit.stop) !== stop);
 }
 
-function observeProgress(progress, sample) {
+function observeProgress(route, progress, sample) {
   const previous = progress?.sample;
   const before = progress?.before;
   const continuous = previous && sample.recordedAt - previous.recordedAt <= MAX_PROGRESS_GAP_MS;
   let visit = continuous && progress.visit &&
     sample.recordedAt - progress.visit.at <= MAX_PROGRESS_AGE_MS ? progress.visit : null;
-  const stop = stopCandidate(sample);
-  const previousStop = stopCandidate(previous);
+  const stop = stopCandidate(route, sample);
+  const previousStop = stopCandidate(route, previous);
   let dwell = stop ? sample : null;
   if (stop && stop === previousStop && sample.recordedAt - previous.recordedAt <= MAX_STOP_INTERVAL_MS) {
     const start = progress.dwell || previous;
@@ -198,7 +223,7 @@ function observeProgress(progress, sample) {
       // Resync past a missed highway destination only with a dwell near the
       // center of a stop. A repeated fix at the geofence edge is ambiguous.
       const target = STOPS[stop];
-      const reliableDwell = !isUnexpectedHighwayStop(visit, stop) || visit.stop === stop ||
+      const reliableDwell = !isUnexpectedHighwayStop(route, visit, stop) || visit.stop === stop ||
         (distanceInMiles(start, target) <= target.radius / 2 &&
           distanceInMiles(sample, target) <= target.radius / 2);
       if (elapsed >= MIN_STOP_INTERVAL_MS && reliableDwell) {
@@ -210,7 +235,7 @@ function observeProgress(progress, sample) {
     // the center of one stop, bracketed by a nearby approach and departure.
     // During a highway leg, only its destination qualifies for this shortcut.
     const target = STOPS[previousStop];
-    if (!isUnexpectedHighwayStop(visit, previousStop) && previous.speed !== null && previous.speed <= 3 &&
+    if (!isUnexpectedHighwayStop(route, visit, previousStop) && previous.speed !== null && previous.speed <= 3 &&
         distanceInMiles(previous, target) <= target.radius / 2 &&
         isNearbyOutside(before, target) && isNearbyOutside(sample, target)) {
       visit = { stop: previousStop, at: previous.recordedAt, arrival: previous.recordedAt };
@@ -219,11 +244,12 @@ function observeProgress(progress, sample) {
   return { sample, before: continuous ? previous : null, dwell, visit };
 }
 
-function readObservations(feed, now) {
+function readObservations(feed, now, night) {
   const byTime = new Map();
   for (const point of feed.history) {
     const time = point.recordedAt;
-    if (time !== null && time <= feed.latest.recordedAt && time >= now - ETA_WINDOW_MS && !byTime.has(time)) {
+    if (time !== null && time <= feed.latest.recordedAt && time >= now - ETA_WINDOW_MS &&
+        !byTime.has(time) && isNightRoute(serviceClock(new Date(time))) === night) {
       byTime.set(time, point);
     }
   }
@@ -240,9 +266,9 @@ function readProgress(scope) {
   }
 }
 
-function progressScope(url) {
+function progressScope(url, { profile, route }) {
   // A feed or route edit invalidates progress without copying the URL or key.
-  const identity = JSON.stringify([url, ACTIVE_ROUTE, ROUTE, ROUTE.stops.map(stop => STOPS[stop])]);
+  const identity = JSON.stringify([url, THURSDAY_NIGHT, profile, route, route.stops.map(stop => STOPS[stop])]);
   let hash = 2166136261;
   for (let i = 0; i < identity.length; i++) {
     hash = Math.imul(hash ^ identity.charCodeAt(i), 16777619);
@@ -270,12 +296,12 @@ function matchingTravelTime(samples, latest, arrival) {
   return remaining;
 }
 
-function historicalETA(observations, tracking, now) {
-  if (!ROUTE.etaHistoryFrom || !(tracking.sample.speed > MAX_STOP_SPEED_MPH) ||
+function historicalETA(route, observations, tracking, now) {
+  if (!route.etaHistoryFrom || !(tracking.sample.speed > MAX_STOP_SPEED_MPH) ||
       now - tracking.sample.recordedAt > 2 * 60000) return null;
-  const firstEligibleTime = Date.parse(ROUTE.etaHistoryFrom);
+  const firstEligibleTime = Date.parse(route.etaHistoryFrom);
   const origin = tracking.visit.stop;
-  const destination = nextStop(origin);
+  const destination = nextStop(route, origin);
   const times = [];
   let progress = null;
   let legSamples = [];
@@ -283,7 +309,7 @@ function historicalETA(observations, tracking, now) {
     if (point.recordedAt < firstEligibleTime) continue;
     if (point.recordedAt >= tracking.sample.recordedAt) break;
     const priorVisit = progress?.visit;
-    progress = observeProgress(progress, point);
+    progress = observeProgress(route, progress, point);
     const visit = progress.visit;
     if (!visit || visit !== priorVisit) {
       if (visit?.stop === destination && priorVisit?.stop === origin &&
@@ -304,21 +330,24 @@ function historicalETA(observations, tracking, now) {
   return remaining > 0 ? Math.max(1, Math.round(remaining / 60000)) : null;
 }
 
-function trackBus(feed, url, now = Date.now()) {
+function trackBus(feed, url, service, now) {
   if (!feed) return { status: "NO SIGNAL" };
   const { latest } = feed;
   if (latest.recordedAt === null) return { status: "UNVERIFIED" };
   if (now - latest.recordedAt > STALE_AFTER_MS || latest.recordedAt > now + 60000) return { status: "STALE" };
+  const { night, route } = service;
 
-  const scope = progressScope(url);
+  const scope = progressScope(url, service);
   const saved = readProgress(scope);
   if (saved && latest.recordedAt < saved.sample.recordedAt) return { status: "STALE" };
-  const observations = readObservations(feed, now);
+  // A fresh fix from the other service window can't establish progress on this route.
+  if (isNightRoute(serviceClock(new Date(latest.recordedAt))) !== night) return { status: "● LIVE" };
+  const observations = readObservations(feed, now, night);
   let progress = saved;
   for (const point of observations) {
     if (point.recordedAt < now - MAX_PROGRESS_AGE_MS ||
         (progress && point.recordedAt <= progress.sample.recordedAt)) continue;
-    progress = observeProgress(progress, point);
+    progress = observeProgress(route, progress, point);
   }
   if (progress !== saved) {
     try {
@@ -333,9 +362,9 @@ function trackBus(feed, url, now = Date.now()) {
   return {
     status: "● LIVE",
     at: atStop ? stop : null,
-    next: nextStop(stop),
-    exit: ROUTE.exitsAfter[stop],
-    eta: atStop ? null : historicalETA(observations, progress, now),
+    next: nextStop(route, stop),
+    exit: route.exitsAfter[stop],
+    eta: atStop ? null : historicalETA(route, observations, progress, now),
   };
 }
 
@@ -346,19 +375,22 @@ function addLabel(container, text, size, color = "#8E8E93", bold = false) {
   return label;
 }
 
-function createWidget(bus) {
+function createWidget(bus, service, now) {
   const widget = new ListWidget();
+  const { disco, night, route } = service;
   const live = bus.status === "● LIVE";
+  const accent = disco ? "#EFA2FF" : "#0A84FF";
   const gradient = new LinearGradient();
-  gradient.colors = [new Color("#1c1c1e"), new Color("#000000")];
-  gradient.locations = [0, 1];
+  const background = disco ? ["#4C155E", "#211044", "#0C081A"] : ["#1c1c1e", "#000000"];
+  gradient.colors = background.map(color => new Color(color));
+  gradient.locations = disco ? [0, 0.55, 1] : [0, 1];
   widget.backgroundGradient = gradient;
   widget.setPadding(16, 16, 16, 16);
   // iOS schedules the actual refresh.
-  widget.refreshAfterDate = new Date(Date.now() + 30 * 1000);
+  widget.refreshAfterDate = new Date(now.getTime() + 30 * 1000);
   const header = widget.addStack();
   header.centerAlignContent();
-  addLabel(header, "ATLAS", 12, "#8E8E93", true);
+  addLabel(header, disco ? "ATLAS  🪩 🍾" : "ATLAS", 12, disco ? accent : "#8E8E93", true);
   header.addSpacer();
   addLabel(header, bus.status, 11, live ? "#32D74B" : "#FF453A", true);
   widget.addSpacer();
@@ -382,22 +414,27 @@ function createWidget(bus) {
     addLabel(widget, detail, 12, bus.eta ? "#32D74B" : "#8E8E93");
   }
   widget.addSpacer();
-  const schedule = addLabel(widget, "Atlas schedule · " + getNextScheduledTimes().join(" • "), 10);
+  const scheduleText = night ? "Thursday night shuttle · 10 PM start" :
+    disco ? "The Arch shuttle starts at 10 PM" : "Atlas schedule · " + getNextScheduledTimes(now).join(" • ");
+  const schedule = addLabel(widget, scheduleText, 10, disco ? "#D9C5F0" : "#8E8E93");
   schedule.lineLimit = 1;
   schedule.minimumScaleFactor = 0.7;
   widget.addSpacer(4);
-  const route = addLabel(widget, [...ROUTE.stops, ROUTE.stops[0]].join(" → "), 11, "#0A84FF", true);
-  route.lineLimit = 1;
-  route.minimumScaleFactor = 0.65;
+  const routeLabel = addLabel(widget, [...route.stops, route.stops[0]].join(" → "), 11, accent, true);
+  routeLabel.lineLimit = 1;
+  routeLabel.minimumScaleFactor = 0.65;
   widget.addSpacer();
   return widget;
 }
 
 const connection = readConnection();
+const feed = connection ? await fetchShuttleData(connection) : null;
+const now = new Date();
+const service = serviceFor(now);
 const bus = connection
-  ? trackBus(await fetchShuttleData(connection), connection.url)
+  ? trackBus(feed, connection.url, service, now.getTime())
   : { status: "SETUP" };
-const widget = createWidget(bus);
+const widget = createWidget(bus, service, now);
 if (config.runsInWidget) Script.setWidget(widget);
 else await widget.presentMedium();
 Script.complete();
