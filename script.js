@@ -9,12 +9,14 @@ const SERVICE_TIME_ZONE = "America/New_York";
 const STALE_AFTER_MS = 10 * 60000;
 const MAX_PROGRESS_AGE_MS = 15 * 60000;
 const MAX_PROGRESS_GAP_MS = 4 * 60000;
-const MIN_STOP_INTERVAL_MS = 8000;
+const MIN_STOP_INTERVAL_MS = 5000;
 const MAX_STOP_INTERVAL_MS = 2 * 60000;
 const MAX_STOP_SPEED_MPH = 5;
 const HISTORY_ROWS = 1000;
 const ETA_WINDOW_MS = 7 * 86400000;
 const ETA_MATCH_MILES = 0.15;
+const ETA_HEADING_MATCH_MILES = 0.30;
+const LIVE_DETAIL_AGE_MS = 2 * 60000;
 const THURSDAY_NIGHT = {
   themeStarts: 21 * 60,
   routeStarts: 22 * 60,
@@ -46,11 +48,20 @@ const STOPS = {
   ARCH: { name: "The Arch", latitude: 33.9575243, longitude: -83.3752855, radius: 0.05 },
 };
 
+// Checkpoint centers are public bridge coordinates from the National Bridge Inventory.
+// The areas include nearby roads and ramps. They are never passenger stops.
+const AREAS = {
+  exit7: { name: "Exit 7 · College Station Rd", latitude: 33.933906, longitude: -83.368394, radius: 0.22 },
+  exit8: { name: "Exit 8 · Lexington Rd", latitude: 33.946639, longitude: -83.356053, radius: 0.22 },
+  river: { name: "North Oconee River", latitude: 33.954533, longitude: -83.367967, radius: 0.18 },
+};
+
 const ACTIVE_ROUTE = "magnolia-detour";
 const ROUTES = {
   "magnolia-detour": {
     stops: ["ATL", "JOUR", "TATE", "BOYD", "COL", "ADER", "JOE"],
     exitsAfter: { ATL: 7, JOE: 8 },
+    areasAfter: { ATL: [AREAS.exit7], JOE: [AREAS.exit8] },
     // Begin learning from deployment-era trips so the previous route cannot skew ETAs.
     etaHistoryFrom: "2026-11-20T03:40:00Z",
   },
@@ -62,6 +73,8 @@ const ROUTES = {
   "thursday-night": {
     stops: ["ATL", "ARCH"],
     exitsAfter: {},
+    areasAfter: { ATL: [AREAS.exit8, AREAS.river], ARCH: [AREAS.river, AREAS.exit8] },
+    allowPartialArrivals: true,
     etaHistoryFrom: "2026-11-20T03:00:00Z",
   },
 };
@@ -213,12 +226,17 @@ function observeProgress(route, progress, sample) {
     sample.recordedAt - progress.visit.at <= MAX_PROGRESS_AGE_MS ? progress.visit : null;
   const stop = stopCandidate(route, sample);
   const previousStop = stopCandidate(route, previous);
+  const gap = previous ? sample.recordedAt - previous.recordedAt : Infinity;
   let dwell = stop ? sample : null;
-  if (stop && stop === previousStop && sample.recordedAt - previous.recordedAt <= MAX_STOP_INTERVAL_MS) {
-    const start = progress.dwell || previous;
+  if (stop && stop === previousStop) {
+    // The feed sends some parked fixes roughly five minutes apart.
+    const stationary = gap <= 6 * 60000 && previous.speed !== null && previous.speed <= 1 &&
+      sample.speed !== null && sample.speed <= 1 && distanceInMiles(previous, sample) <= 0.01;
+    const start = gap <= MAX_STOP_INTERVAL_MS ? progress.dwell || previous : previous;
     const elapsed = sample.recordedAt - start.recordedAt;
     const drift = distanceInMiles(start, sample);
-    if (drift <= 0.025 && (elapsed < MIN_STOP_INTERVAL_MS || drift * 3600000 / elapsed <= MAX_STOP_SPEED_MPH)) {
+    if ((gap <= MAX_STOP_INTERVAL_MS || stationary) && drift <= 0.025 &&
+        (elapsed < MIN_STOP_INTERVAL_MS || drift * 3600000 / elapsed <= MAX_STOP_SPEED_MPH)) {
       dwell = start;
       // Resync past a missed highway destination only with a dwell near the
       // center of a stop. A repeated fix at the geofence edge is ambiguous.
@@ -276,58 +294,113 @@ function progressScope(url, { profile, route }) {
   return hash >>> 0;
 }
 
-function matchingDirection(first, second) {
-  if (first.speed < 5 || second.speed < 5 || first.heading === null || second.heading === null) return true;
+function headingDifference(first, second) {
+  if (!(first.speed > 5 && second.speed > 5) || first.heading === null || second.heading === null) return null;
   const difference = Math.abs(first.heading - second.heading);
-  return Math.min(difference, 360 - difference) <= 60;
+  return Math.min(difference, 360 - difference);
 }
 
 function matchingTravelTime(samples, latest, arrival) {
-  let closest = ETA_MATCH_MILES;
-  let remaining = null;
+  let match = null;
   for (const sample of samples) {
-    if (sample.recordedAt >= arrival || !matchingDirection(sample, latest)) continue;
+    if (sample.recordedAt >= arrival || arrival - sample.recordedAt > MAX_PROGRESS_AGE_MS) continue;
+    const heading = headingDifference(sample, latest);
+    if (heading !== null && heading > 60) continue;
     const distance = distanceInMiles(sample, latest);
-    if (distance <= closest) {
-      closest = distance;
-      remaining = arrival - sample.recordedAt;
+    const tolerance = heading === null ? ETA_MATCH_MILES : ETA_HEADING_MATCH_MILES;
+    if (distance <= tolerance && (!match || distance < match.distance)) {
+      match = { distance, remaining: arrival - sample.recordedAt };
     }
   }
-  return remaining;
+  return match;
 }
 
-function historicalETA(route, observations, tracking, now) {
-  if (!route.etaHistoryFrom || !(tracking.sample.speed > MAX_STOP_SPEED_MPH) ||
-      now - tracking.sample.recordedAt > 2 * 60000) return null;
+function observedTravelTimes(route, observations, tracking) {
   const firstEligibleTime = Date.parse(route.etaHistoryFrom);
   const origin = tracking.visit.stop;
   const destination = nextStop(route, origin);
-  const times = [];
+  const matches = [];
   let progress = null;
   let legSamples = [];
   for (const point of observations) {
     if (point.recordedAt < firstEligibleTime) continue;
     if (point.recordedAt >= tracking.sample.recordedAt) break;
     const priorVisit = progress?.visit;
+    const previous = progress?.sample;
     progress = observeProgress(route, progress, point);
     const visit = progress.visit;
-    if (!visit || visit !== priorVisit) {
-      if (visit?.stop === destination && priorVisit?.stop === origin &&
-          visit.arrival - priorVisit.at <= MAX_PROGRESS_AGE_MS) {
-        const time = matchingTravelTime(legSamples, tracking.sample, visit.arrival);
-        if (time !== null) times.push(time);
+    // A park confirmation can arrive after a gap. Its arrival is the fix
+    // before the gap, so only evidence up to that earlier fix is eligible.
+    if (previous && point.recordedAt - previous.recordedAt > MAX_PROGRESS_GAP_MS &&
+        visit?.arrival !== previous.recordedAt) legSamples = [];
+    if (visit && visit !== priorVisit) {
+      if (visit.stop === destination) {
+        const fullLeg = priorVisit?.stop === origin && visit.arrival - priorVisit.at <= MAX_PROGRESS_AGE_MS;
+        const partialLeg = route.allowPartialArrivals && !priorVisit && legSamples.length >= 3 &&
+          legSamples.some(sample => visit.arrival - sample.recordedAt <= MAX_PROGRESS_AGE_MS &&
+            distanceInMiles(sample, STOPS[destination]) > 0.25);
+        if (fullLeg || partialLeg) {
+          const match = matchingTravelTime(legSamples, tracking.sample, visit.arrival);
+          if (match) matches.push(match);
+        }
       }
       legSamples = [];
     }
-    if (visit && point.recordedAt > visit.at) legSamples.push(point);
+    if (!visit || point.recordedAt > visit.at) legSamples.push(point);
   }
-  if (times.length < 2) return null;
+  return matches;
+}
+
+function historicalETA(route, observations, tracking, now) {
+  const { sample, before, visit } = tracking;
+  const age = Math.max(0, now - sample.recordedAt);
+  const moving = sample.speed > MAX_STOP_SPEED_MPH;
+  const movedRecently = before && sample.recordedAt - before.recordedAt <= LIVE_DETAIL_AGE_MS &&
+    distanceInMiles(before, sample) > 0.025;
+  if (!route.etaHistoryFrom || age > LIVE_DETAIL_AGE_MS || (!moving && !movedRecently) ||
+      distanceInMiles(sample, STOPS[visit.stop]) <= STOPS[visit.stop].radius) return null;
+  const matches = observedTravelTimes(route, observations, tracking);
+  if (!matches.length) return null;
+  const times = matches.map(match => match.remaining);
   times.sort((first, second) => first - second);
   const middle = Math.floor(times.length / 2);
   const median = (times[middle] + times[Math.floor((times.length - 1) / 2)]) / 2;
   if (times[times.length - 1] - times[0] > Math.max(2 * 60000, median / 2)) return null;
-  const remaining = median - Math.max(0, now - tracking.sample.recordedAt);
-  return remaining > 0 ? Math.max(1, Math.round(remaining / 60000)) : null;
+  const remaining = (median - (moving ? age : 0)) / 60000;
+  if (remaining <= 0) return null;
+  const closeMatches = matches.filter(match => match.distance <= ETA_MATCH_MILES).length;
+  if (closeMatches >= 2 && moving) return String(Math.max(1, Math.round(remaining)));
+  const earliest = Math.max(1, Math.floor(remaining - 1));
+  const latest = Math.max(earliest + 1, Math.ceil(remaining + 1));
+  return earliest + "–" + latest;
+}
+
+function routeArea(route, progress, destination, observations, now) {
+  const { sample, before, visit } = progress;
+  if (now - sample.recordedAt > LIVE_DETAIL_AGE_MS) return null;
+  const origin = visit.stop;
+  const from = STOPS[origin];
+  const to = STOPS[destination];
+  const nearPrevious = before && sample.recordedAt - before.recordedAt <= LIVE_DETAIL_AGE_MS;
+  const toDistance = distanceInMiles(sample, to);
+  const fromDistance = distanceInMiles(sample, from);
+  if (nearPrevious && toDistance <= 0.22 && toDistance < fromDistance &&
+      distanceInMiles(before, to) - toDistance >= 0.02) return "Approaching " + to.name;
+  const areas = route.areasAfter?.[origin] || [];
+  const nearby = areas.find(area => distanceInMiles(sample, area) <= area.radius);
+  if (nearby) return "Near " + nearby.name;
+  if (nearPrevious && fromDistance > from.radius && fromDistance <= 0.35 && fromDistance < toDistance &&
+      fromDistance - distanceInMiles(before, from) >= 0.02) return "Leaving " + from.name;
+  const after = Math.max(visit.at, sample.recordedAt - 3 * 60000);
+  if (before && before.recordedAt > after) {
+    const passed = areas.find(area => distanceInMiles(before, area) <= area.radius);
+    if (passed) return "Past " + passed.name;
+  }
+  for (let i = observations.length - 1; i >= 0 && observations[i].recordedAt > after; i--) {
+    const passed = areas.find(area => distanceInMiles(observations[i], area) <= area.radius);
+    if (passed) return "Past " + passed.name;
+  }
+  return null;
 }
 
 function trackBus(feed, url, service, now) {
@@ -359,11 +432,13 @@ function trackBus(feed, url, service, now) {
   const stop = progress?.visit?.stop;
   if (!stop) return { status: "● LIVE", next: null };
   const atStop = progress.visit.at === latest.recordedAt;
+  const next = nextStop(route, stop);
   return {
     status: "● LIVE",
     at: atStop ? stop : null,
-    next: nextStop(route, stop),
+    next,
     exit: route.exitsAfter[stop],
+    area: atStop ? null : routeArea(route, progress, next, observations, now),
     eta: atStop ? null : historicalETA(route, observations, progress, now),
   };
 }
@@ -379,20 +454,22 @@ function createWidget(bus, service, now) {
   const widget = new ListWidget();
   const { disco, night, route } = service;
   const live = bus.status === "● LIVE";
-  const accent = disco ? "#EFA2FF" : "#0A84FF";
+  const accent = disco ? "#5CF5D8" : "#0A84FF";
+  const highlight = disco ? "#FFD098" : "#32D74B";
+  const muted = disco ? "#FFE1F4" : "#8E8E93";
   const gradient = new LinearGradient();
-  const background = disco ? ["#4C155E", "#211044", "#0C081A"] : ["#1c1c1e", "#000000"];
+  const background = disco ? ["#2A123E", "#711D55", "#782E2F", "#1E152D"] : ["#1c1c1e", "#000000"];
   gradient.colors = background.map(color => new Color(color));
-  gradient.locations = disco ? [0, 0.55, 1] : [0, 1];
+  gradient.locations = disco ? [0, 0.48, 0.78, 1] : [0, 1];
   widget.backgroundGradient = gradient;
   widget.setPadding(16, 16, 16, 16);
   // iOS schedules the actual refresh.
   widget.refreshAfterDate = new Date(now.getTime() + 30 * 1000);
   const header = widget.addStack();
   header.centerAlignContent();
-  addLabel(header, disco ? "ATLAS  🪩 🍾" : "ATLAS", 12, disco ? accent : "#8E8E93", true);
+  addLabel(header, disco ? "ATLAS  🪩 🍾" : "ATLAS", 12, muted, true);
   header.addSpacer();
-  addLabel(header, bus.status, 11, live ? "#32D74B" : "#FF453A", true);
+  addLabel(header, bus.status, 11, live ? (disco ? accent : highlight) : (disco ? "#FFC7D0" : "#FF453A"), true);
   widget.addSpacer();
   if (bus.status === "SETUP") {
     addLabel(widget, "Setup needed", 22, "#FFFFFF", true);
@@ -406,17 +483,22 @@ function createWidget(bus, service, now) {
     const headline = bus.at ? "At: " + STOPS[bus.at].name :
       bus.next ? "Next: " + STOPS[bus.next].name : "Route position unknown";
     addLabel(widget, headline, 18, "#FFFFFF", true);
-    if (bus.at) addLabel(widget, "Next: " + STOPS[bus.next].name, 12);
+    if (bus.at) addLabel(widget, "Next: " + STOPS[bus.next].name, 12, muted);
+    if (bus.area) {
+      const area = addLabel(widget, bus.area, 12, accent, true);
+      area.lineLimit = 1;
+      area.minimumScaleFactor = 0.7;
+    }
   }
   if (bus.status !== "SETUP" && bus.status !== "NO SIGNAL") {
     const eta = bus.eta ? "Approx. " + bus.eta + " min" : "ETA unavailable";
     const detail = bus.exit ? "Highway via Exit " + bus.exit + " · " + eta : eta;
-    addLabel(widget, detail, 12, bus.eta ? "#32D74B" : "#8E8E93");
+    addLabel(widget, detail, 12, bus.eta ? highlight : muted, Boolean(bus.eta));
   }
   widget.addSpacer();
   const scheduleText = night ? "Thursday night shuttle · 10 PM start" :
     disco ? "The Arch shuttle starts at 10 PM" : "Atlas schedule · " + getNextScheduledTimes(now).join(" • ");
-  const schedule = addLabel(widget, scheduleText, 10, disco ? "#D9C5F0" : "#8E8E93");
+  const schedule = addLabel(widget, scheduleText, 10, muted);
   schedule.lineLimit = 1;
   schedule.minimumScaleFactor = 0.7;
   widget.addSpacer(4);

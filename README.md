@@ -55,7 +55,9 @@ The widget uses the last confirmed stop visit to find the next scheduled stop. I
 
 ### GPS history estimates and schedule
 
-The Supabase location feed supplies positions and timestamps. The widget shows **Approx. N min** when at least two completed trips between the same consecutive stops have GPS fixes near the moving bus’s current position. It uses the median observed time remaining from those fixes, checks heading when available, and rejects estimates when the samples disagree materially or the latest fix is over two minutes old. **ETA unavailable** appears while the bus is at a stop or whenever the available data is too sparse or ambiguous. Highway estimates use observed trip times and need no exit coordinates or road-distance model.
+The widget estimates time to the next stop from Supabase GPS timestamps. With one comparable trip it displays a range, such as **Approx. 2–5 min**. Two or more close matches with consistent times can support a single rounded estimate. The Thursday night loop can also learn from a continuous arrival trace that starts partway through the leg and ends in a confirmed visit. The widget checks heading on moving fixes when available. It displays **ETA unavailable** while the bus is at a stop, when the newest fix is over two minutes old, or when comparable observations are missing or disagree materially. Highway ETAs use observed driving times.
+
+Area labels use the active leg and the latest recorded fixes. They show when the bus is leaving or approaching a stop, near a checkpoint, or has recently passed one. Daytime highway checkpoints are College Station Road (Exit 7) and Lexington Road (Exit 8). The Arch loop uses the Exit 8 and North Oconee River bridge areas in both directions. Centers come from National Bridge Inventory structures 5900380, 5900420, and 5900250. A checkpoint label requires a recorded GPS fix inside its area. It leaves the next passenger stop unchanged. [National Bridge Inventory](https://services.arcgis.com/xOi1kZaI0eWDREZv/ArcGIS/rest/services/NTAD_National_Bridge_Inventory/FeatureServer/0) · [Georgia DOT Athens Loop exits](https://www.dot.ga.gov/DriveSmart/MapsData/Documents/StripMaps_Exits/SR-10LP_AthensLoop.pdf)
 
 The detour uses trips recorded from November 19, 2026 at 10:40 PM Eastern onward to keep previous-route travel times out of the estimate. Expect **ETA unavailable** until the database contains enough matching detour trips. The configured history window covers up to seven days within the rows the endpoint returns.
 
@@ -65,7 +67,7 @@ To end the detour, change `ACTIVE_ROUTE` in [script.js](script.js) from `"magnol
 
 ### Thursday night shuttle
 
-At 9 PM Thursday Eastern, the widget switches to a purple disco theme with 🪩 and 🍾 and displays a 10 PM start notice. At 10 PM, tracking switches to **Atlas Athens → The Arch → Atlas Athens**. The night theme and route extend past midnight and end at 3 AM Friday Eastern by default. Adjust `THURSDAY_NIGHT.fridayEnds` in [script.js](script.js) when the end time is confirmed.
+At 9 PM Thursday Eastern, the widget switches to a pink-and-orange sunset palette with teal accents, 🪩 and 🍾, and a 10 PM start notice. At 10 PM, tracking switches to **Atlas Athens → The Arch → Atlas Athens**. The night theme and route extend past midnight and end at 3 AM Friday Eastern by default. Adjust `THURSDAY_NIGHT.fridayEnds` in [script.js](script.js) when the end time is confirmed.
 
 The Arch geofence is centered on the [mapped UGA landmark](https://www.openstreetmap.org/node/4886558902). Check that the shuttle’s actual pickup curb falls within the geofence. The night route confirms stops and estimates travel time using GPS observations from its own service window. iOS applies the theme and route when it next refreshes the widget.
 
@@ -162,5 +164,5 @@ Node.js 18+ is only needed to run the local mocked tests, not to use the widget:
 node --test tests/*.test.cjs
 ```
 
-Tests mock the Scriptable APIs and replay GPS fixtures for both highway legs, missed updates, stop confirmation, return to Atlas, and the ETA fallback. They also cover Thursday night transitions, daylight saving time, and both directions of the Arch loop. On iPhone, run Loader with `script.js` in the app and check the medium widget. For the detour, confirm that Exit 7 points toward Journalism and Exit 8 points toward Atlas Athens. On Thursday night, confirm that the theme appears at the next refresh after 9 PM and that tracking switches to the Arch loop after 10 PM.
+Tests mock the Scriptable APIs and replay GPS fixtures for both highway legs, checkpoint labels, missed updates, stop confirmation, and sparse ETA history. They also cover Thursday night transitions, daylight saving time, and both directions of the Arch loop. On iPhone, run Loader with `script.js` to check the medium preview. During a trip, check that the checkpoint labels and ETA update on the next widget refresh.
 
