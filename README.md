@@ -12,7 +12,7 @@ The tracker needs an authorized bus location feed. No Supabase endpoint, bus ide
 
 1. Install [Scriptable](https://scriptable.app/) on your iPhone or iPad.
 2. Obtain an **authorized Supabase bus location REST URL** and its **publishable key** (or legacy **anon key**) from your feed administrator. If you operate the backend, find these in your Supabase project’s API settings. Do not use a secret key or `service_role` key. An API key alone does not grant access: the backend must allow the intended reads through its Row Level Security policies.
-3. The endpoint should select the latest location for **one bus**, for example:
+3. Use a newest-first location query filtered to **one bus**. Existing URLs like this one still work:
 
    ```text
    https://YOUR_PROJECT.supabase.co/rest/v1/bus_locations?select=latitude,longitude,speed_mph,recorded_at&bus_id=eq.YOUR_BUS_ID&order=recorded_at.desc&limit=1
@@ -23,7 +23,7 @@ The tracker needs an authorized bus location feed. No Supabase endpoint, bus ide
 5. Choose how to run the tracker:
    - **Direct:** Copy [script.js](script.js) into Scriptable as **Atlas Bus** and run it. A medium preview should appear. Add a medium Scriptable Home Screen widget and select **Atlas Bus** as its script. No widget parameter is needed.
    - **Automatic source updates:** Follow the Loader setup below, then set the Home Screen widget’s script to **Loader** and its **Parameter** to `script.js`. Use a **medium** widget for the route and timetable. To preview the tracker in the app through Loader, change `DEFAULT_FILE` in your phone’s Loader script to `"script.js"`, then choose **Run widget**.
-6. If you see **Setup needed**, run Setup Bus on the same device. For **No Signal**, check connectivity, the endpoint filter, key permissions, and whether the feed contains a valid record. No Supabase requests are made outside service hours.
+6. If you see **Setup needed**, run Setup Bus on the same device. For **No Signal**, check connectivity, the endpoint filter, key permissions, and whether the feed contains a valid record. The tracker fetches whenever Scriptable runs it, including at night and on weekends.
 
 To change the connection, run Setup Bus again. To remove it, clear both fields and save. Do not put connection details in GitHub files or widget parameters. This repository does not publish the connection settings supplied by the original author.
 
@@ -36,21 +36,32 @@ The endpoint must return a JSON array with the newest record first (or a single 
   "latitude": 33.943026,
   "longitude": -83.338263,
   "speed_mph": 12,
+  "heading": 90,
   "recorded_at": "2026-11-16T15:00:00Z"
 }]
 ```
 
-The timestamp above only illustrates the format. The live feed must supply current timestamps with a timezone. The parser also accepts `lat`, `lng`/`lon`, or `location.latitude`/`location.longitude`. Speed is in miles per hour; missing or invalid speed is treated as zero. Invalid or missing coordinates show **No Signal**. Missing/invalid timestamps show **UNVERIFIED**; records older than 10 minutes (or over a minute in the future) show **STALE** and suppress the ETA. There is no offline cache of bus telemetry. The Loader’s cache holds JavaScript source only.
+The parser also accepts `lat`, `lng`/`lon`, or `location.latitude`/`location.longitude`. Supply `recorded_at` with a timezone, `speed_mph` in miles per hour, and optional `heading` in degrees from 0 to less than 360. Missing or invalid speed is treated as unknown. Invalid or missing coordinates in the newest record show **No Signal**. Missing or invalid timestamps show **UNVERIFIED**. The widget shows **STALE** for a location over 10 minutes old, over one minute into the future, or older than the most recent observation already processed on the device.
 
-### Route, hours, and ETA limits
+For the documented single-bus query, the tracker requests up to 1,000 rows by expanding `limit=1` at request time. It retries the original URL if the history request fails. The saved URL and key stay in Scriptable Keychain. Other query shapes can return their own newest-first history. Single-row feeds work with the recent observations collected across runs, so they may take longer to confirm a stop. ETAs require a history response.
 
-The supplied route is ATL → MAIN → JOUR → TATE → BOYD → COL → ADER → JOE → ATL. The widget retains the original coordinates, stop radii, and weekday Atlas departure timetable. Verify the timetable and route with the operator; holidays and service exceptions are not modeled.
+### Magnolia Street detour
 
-Service hours are Monday–Friday, 6:45 AM–7 PM in `America/New_York`, including daylight saving time. `FORCE_ONLINE` defaults to `false`; set it to `true` only for testing outside those hours. The widget requests another refresh in 30 seconds, but iOS chooses the actual refresh time.
+Atlas Athens → **highway via Exit 7** → Journalism → Tate → Boyd → Coliseum → Aderhold → Joe Frank → **highway via Exit 8** → Atlas Athens.
 
-ETAs are rough estimates using straight-line distance to the stop after the nearest stop and reported speed, falling back to 5 mph when stationary. The route display assumes forward travel in the listed stop order; it does not infer direction from GPS history or model road travel, traffic, or dwell times. A nearest stop is not always the last stop passed. Treat the result as an approximation, not an official arrival prediction.
+Main Library is removed from the active route. The remaining stops retain their coordinates and geofence radii. The two exits label the highway legs between passenger stops.
 
-To adapt this to another route, edit `ROUTE_STOPS`, `SCHEDULED_TIMES`, `SERVICE_TIME_ZONE`, and the service-hours logic in your own copy of `script.js`, then configure that route’s feed on your device.
+The widget uses the last confirmed stop visit to find the next scheduled stop. It confirms a visit from slow, closely spaced GPS fixes in one stop’s geofence, or from a slow fix near the center with a nearby approach and departure. While tracking a highway leg, the single-fix rule applies only to that leg’s destination. A confirmed later stop can restore progress after a missed visit. The widget shows **Route position unknown** until the feed provides a visit, after a gap of more than four minutes between fixes, or when the last confirmed visit is more than 15 minutes old. Arriving back at Atlas starts a new loop toward Journalism. A small progress snapshot and up to three GPS fixes are saved separately in Scriptable Keychain. A fresh feed response is required to display live progress.
+
+### GPS history estimates and schedule
+
+The Supabase location feed supplies positions and timestamps. The widget shows **Approx. N min** when at least two completed trips between the same consecutive stops have GPS fixes near the moving bus’s current position. It uses the median observed time remaining from those fixes, checks heading when available, and rejects estimates when the samples disagree materially or the latest fix is over two minutes old. **ETA unavailable** appears while the bus is at a stop or whenever the available data is too sparse or ambiguous. Highway estimates use observed trip times and need no exit coordinates or road-distance model.
+
+The detour uses trips recorded from November 19, 2026 at 10:40 PM Eastern onward to keep previous-route travel times out of the estimate. Expect **ETA unavailable** until the database contains enough matching detour trips. The configured history window covers up to seven days within the rows the endpoint returns.
+
+The Atlas timetable uses Monday–Friday, 6:45 AM–7 PM in `America/New_York` and accounts for daylight saving time. Verify the published departure times with the operator. These hours are informational. The widget requests another refresh in 30 seconds, and iOS chooses the actual refresh time.
+
+To end the detour, change `ACTIVE_ROUTE` in [script.js](script.js) from `"magnolia-detour"` to `"regular"`. This restores the Main Library stop and clears the previous route’s progress on the next update. To estimate times on the restored route, set that profile’s `etaHistoryFrom` to the timezone-qualified resumption time. To edit the detour in the future, update its `stops` and `exitsAfter` together and move `etaHistoryFrom` forward to the new route’s effective time.
 
 ## Quick setup: try the demo
 
@@ -145,5 +156,5 @@ Node.js 18+ is only needed to run the local mocked tests, not to use the widget:
 node --test tests/*.test.cjs
 ```
 
-Tests mock the Scriptable APIs; final device behavior should be checked in Scriptable on iOS.
+Tests mock the Scriptable APIs and replay GPS fixtures for both highway legs, missed updates, stop confirmation, return to Atlas, and the ETA fallback. On iPhone, run Loader with `script.js` in the app and check the medium widget during one full loop. Confirm that Exit 7 points toward Journalism, Exit 8 points toward Atlas Athens, the stop labels advance at the actual pickups, and the feed still updates outside the timetable when the bus sends data.
 
